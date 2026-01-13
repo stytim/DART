@@ -20,6 +20,7 @@ from utils.smpl_utils import *
 from utils.misc_util import encode_text
 from mld.train_mvae import Args as MVAEArgs
 from mld.train_mld import MLDArgs, create_gaussian_diffusion, DenoiserMLPArgs, DenoiserTransformerArgs
+from utils.unity_streamer import UnityStreamer
 
 
 @dataclass
@@ -33,6 +34,11 @@ class RolloutArgs:
     guidance_param: float = 2.5
     use_predicted_joints: int = 1
     num_rollouts: int = 20
+    
+    # Streaming options
+    enable_streaming: int = 0
+    stream_ip: str = '127.0.0.1'
+    stream_port: int = 8080
 
 
 class ClassifierFreeWrapper(torch.nn.Module):
@@ -131,6 +137,11 @@ if __name__ == '__main__':
     
     sample_fn = diffusion.ddim_sample_loop
     
+    streamer = None
+    if args.enable_streaming:
+        streamer = UnityStreamer(host=args.stream_ip, port=args.stream_port)
+        print(f"Streaming enabled on {args.stream_ip}:{args.stream_port}")
+
     print(f"\nBenchmarking {args.num_rollouts} rollouts WITHOUT viewer...")
     rollout_times = []
     
@@ -195,6 +206,46 @@ if __name__ == '__main__':
         future_feature_dict = primitive_utility.transform_feature_to_world(future_feature_dict)
         future_tensor = primitive_utility.dict_to_tensor(future_feature_dict)
         motion_tensor = torch.cat([motion_tensor, future_tensor], dim=1)
+        
+        # Stream the frames just generated
+        if streamer:
+            # We need to extract the rotation matrices for the NEW frames
+            # future_feature_dict has them!
+            # It has 'transf_rotmat', 'global_orient' (which is actually in poses_6d?), etc.
+            # Wait, transform_feature_to_world returns world_feature_dict.
+            # world_feature_dict has 'poses_6d' which contains global_orient and body_pose.
+            
+            # poses_6d is [B, T, 22*6] (continuous 6d rep)
+            # We need to convert to matrices for the streamer
+            
+            # Using primitive_utility to help extraction if needed, or manual conversion
+            # poses_6d -> matrices
+            
+            # Let's look at how future_feature_dict was made.
+            # future_feature_dict = primitive_utility.transform_feature_to_world(future_feature_dict)
+            
+            # Let's extract from future_feature_dict['poses_6d']
+            world_poses_6d = future_feature_dict['poses_6d'] # [B, F, 132]
+            world_transl = future_feature_dict['transl']     # [B, F, 3]
+            
+            # Convert 6D to Matrix
+            B_f, F_f, _ = world_poses_6d.shape
+            global_orient_6d = world_poses_6d[..., :6]
+            body_pose_6d = world_poses_6d[..., 6:]
+            
+            global_orient = transforms.rotation_6d_to_matrix(global_orient_6d) # [B, F, 3, 3]
+            body_pose = transforms.rotation_6d_to_matrix(body_pose_6d.reshape(B_f, F_f, 21, 6)).reshape(B_f, F_f, 21, 3, 3)
+            
+            # Stream each frame in the generated batch
+            for f in range(F_f):
+                streamer.send_frame(
+                    world_transl[0, f],
+                    global_orient[0, f],
+                    body_pose[0, f]
+                )
+            
+            # Add a small delay to simulate real-time if desired, or just blast it
+            # time.sleep(1.0)
         
         t_end = time.time()
         

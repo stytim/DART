@@ -25,6 +25,10 @@ import copy
 import pyrender
 import trimesh
 import threading
+try:
+    import pandas as pd # Ensure pandas is available if needed, though not strictly used here
+except ImportError:
+    pass
 
 from model.mld_denoiser import DenoiserMLP, DenoiserTransformer
 from model.mld_vae import AutoMldVae
@@ -41,6 +45,7 @@ from mld.train_mvae import DataArgs, TrainArgs
 from mld.train_mld import DenoiserArgs, MLDArgs, create_gaussian_diffusion, DenoiserMLPArgs, DenoiserTransformerArgs
 from visualize.vis_seq import makeLookAt
 from pyrender.trackball import Trackball
+from utils.unity_streamer import UnityStreamer
 
 debug = 0
 
@@ -52,6 +57,7 @@ frame_idx = 0
 text_prompt = 'stand'
 text_embedding = None
 motion_tensor = None
+streamer = None
 
 @dataclass
 class RolloutArgs:
@@ -71,6 +77,11 @@ class RolloutArgs:
     zero_noise: int = 0
     use_predicted_joints: int = 0
     
+    # Streaming options
+    enable_streaming: int = 0
+    stream_ip: str = '127.0.0.1'
+    stream_port: int = 8080
+
     debug: int = 0
     """Enable debug mode with timing info (0=off, 1=on)"""
 
@@ -243,11 +254,14 @@ def read_input():
 # Global cache for pre-computed vertices and joints
 vertex_cache = None  # Will hold pre-computed vertices for all frames
 joints_cache = None  # Will hold pre-computed joints for all frames
+transl_cache = None
+global_orient_cache = None
+body_pose_cache = None
 faces_cache = None   # Faces don't change
 
 def precompute_meshes(start_frame, end_frame):
     """Pre-compute SMPL meshes for a range of frames in batch"""
-    global vertex_cache, joints_cache, faces_cache
+    global vertex_cache, joints_cache, faces_cache, transl_cache, global_orient_cache, body_pose_cache
     
     num_frames = end_frame - start_frame
     if num_frames <= 0:
@@ -281,6 +295,11 @@ def precompute_meshes(start_frame, end_frame):
     new_vertices = output.vertices.reshape(B, T, -1, 3)[0]  # [T, V, 3]
     new_joints = output.joints[:, :22, :].reshape(B, T, 22, 3)[0]  # [T, 22, 3]
     
+    # Cache rotations and translation for streaming
+    new_transl = smpl_dict['transl'].reshape(B, T, 3)[0]
+    new_global_orient = smpl_dict['global_orient'].reshape(B, T, 3, 3)[0]
+    new_body_pose = smpl_dict['body_pose'].reshape(B, T, 21, 3, 3)[0]
+
     if faces_cache is None:
         faces_cache = body_model.faces.copy()
     
@@ -288,9 +307,15 @@ def precompute_meshes(start_frame, end_frame):
     if vertex_cache is None:
         vertex_cache = new_vertices
         joints_cache = new_joints
+        transl_cache = new_transl
+        global_orient_cache = new_global_orient
+        body_pose_cache = new_body_pose
     else:
         vertex_cache = torch.cat([vertex_cache, new_vertices], dim=0)
         joints_cache = torch.cat([joints_cache, new_joints], dim=0)
+        transl_cache = torch.cat([transl_cache, new_transl], dim=0)
+        global_orient_cache = torch.cat([global_orient_cache, new_global_orient], dim=0)
+        body_pose_cache = torch.cat([body_pose_cache, new_body_pose], dim=0)
 
 def get_body_fast():
     """Fast version that uses pre-computed cache"""
@@ -427,6 +452,17 @@ def start():
                 # Fallback: synchronous rollout if async didn't start
                 rollout(denoiser_args, denoiser_model, vae_args, vae_model, diffusion, dataset, rollout_args)
         
+        # Stream data
+        if streamer and frame_idx < vertex_cache.shape[0]:
+            try:
+                streamer.send_frame(
+                    transl_cache[frame_idx],
+                    global_orient_cache[frame_idx],
+                    body_pose_cache[frame_idx]
+                )
+            except Exception as e:
+                print(f"Streaming error: {e}")
+
         t_rollout = time.time()
         
         frame_times.append(t_rollout - t_frame_start)
@@ -438,6 +474,8 @@ def start():
         time.sleep(sleep_time)
 
     viewer.close_external()
+    if streamer:
+        streamer.close()
     if rollout_thread is not None and rollout_thread.is_alive():
         rollout_thread.join()
     input_thread.join()
@@ -502,6 +540,10 @@ if __name__ == '__main__':
     # Pre-compute meshes for initial frames
     print("Pre-computing initial meshes...")
     precompute_meshes(0, motion_tensor.shape[1])
+
+    if rollout_args.enable_streaming:
+        streamer = UnityStreamer(host=rollout_args.stream_ip, port=rollout_args.stream_port)
+        print(f"Streaming enabled on {rollout_args.stream_ip}:{rollout_args.stream_port}")
 
     start()
 
