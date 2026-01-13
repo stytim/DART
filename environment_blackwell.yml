@@ -1,0 +1,115 @@
+# Environment for NVIDIA Blackwell GPUs (RTX 6000 Pro, RTX 50 series, etc.)
+# Compute Capability: sm_120
+# Requires: CUDA 12.8+, PyTorch 2.9.1+, Python 3.10+
+
+name: DART_Blackwell
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # Python 3.11 (recommended for PyTorch 2.9.1)
+  - python=3.11
+
+  # CUDA 12.8 for Blackwell support
+  - cuda-toolkit=12.8
+  - cuda-cudart=12.8
+  - cuda-nvrtc=12.8
+  - cudnn=9.*
+
+  # PyTorch 2.9.1 with CUDA 12.8
+  #- pytorch=2.9.1=*cuda12.8*
+  #- torchvision=0.20.*=*cuda12.8*
+  #- torchaudio=2.5.*=*cuda12.8*
+
+  # Core scientific packages
+  - numpy>=1.24,<2.0
+  - scipy>=1.11
+  - pandas>=2.0
+  - scikit-learn>=1.3
+  - matplotlib>=3.7
+
+  # Other dependencies
+  - pillow>=10.0
+  - pyyaml>=6.0
+  - tqdm
+  - joblib
+  - networkx
+  - sympy
+  - filelock
+  - jinja2
+  - requests
+  - packaging
+  - setuptools
+  - wheel
+  - pip
+
+  # Visualization
+  - pyqt>=5.15
+  - ffmpeg>=6.0
+
+  # pip packages
+  #- pip:
+      # pytorch3d must be built from source for CUDA 12.8
+      # - git+https://github.com/facebookresearch/pytorch3d.git
+      
+      # # CLIP
+      # - git+https://github.com/openai/CLIP.git
+      
+      # # Core ML/DL utilities
+      # - einops>=0.7.0
+      # - omegaconf>=2.3.0
+      # - hydra-core>=1.3.2
+      # - wandb>=0.16
+      # - tensorboard>=2.14
+      # - tensorboardx>=2.6
+      
+      # # Body models
+      # - smplx>=0.1.28
+      # - chumpy>=0.70
+      
+      # # Geometry and 3D
+      # - trimesh>=4.0
+      # - pyrender>=0.1.45
+      # - open3d>=0.18
+      # - mesh2sdf>=1.1.0
+      # - rtree>=1.0
+      # - shapely>=2.0
+      
+      # # NLP
+      # - spacy>=3.7
+      # - ftfy>=6.1
+      
+      # # Utilities
+      # - tyro>=0.8
+      # - rich>=13.0
+      # - h5py>=3.10
+      # - imageio>=2.34
+      # - scikit-image>=0.22
+      # - blobfile>=2.1
+      # - loralib>=0.1
+      # - torch-dct>=0.1
+
+# =============================================================================
+# INSTALLATION INSTRUCTIONS FOR BLACKWELL GPUs
+# =============================================================================
+#
+# 1. Create the conda environment:
+#    conda env create -f environment_blackwell.yml
+#    conda activate DART
+#
+# 2. Install pytorch3d from source (required for CUDA 12.8):
+#    pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+#
+#    If the above fails, try building with specific CUDA arch:
+#    TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+#
+# 3. Verify CUDA and PyTorch:
+#    python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.version.cuda}'); print(f'GPU: {torch.cuda.get_device_name(0)}')"
+#
+# 4. If you see sm_120 warnings, ensure your driver supports CUDA 12.8:
+#    nvidia-smi
+#    (Driver version should be 570.x or higher for Blackwell)
+#
+# =============================================================================
