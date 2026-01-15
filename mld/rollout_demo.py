@@ -46,6 +46,7 @@ from mld.train_mld import DenoiserArgs, MLDArgs, create_gaussian_diffusion, Deno
 from visualize.vis_seq import makeLookAt
 from pyrender.trackball import Trackball
 from utils.unity_streamer import UnityStreamer
+from utils.unity_prompt_receiver import UnityPromptReceiver
 
 debug = 0
 
@@ -58,6 +59,7 @@ text_prompt = 'stand'
 text_embedding = None
 motion_tensor = None
 streamer = None
+prompt_receiver = None
 
 @dataclass
 class RolloutArgs:
@@ -79,8 +81,12 @@ class RolloutArgs:
     
     # Streaming options
     enable_streaming: int = 0
-    stream_ip: str = '127.0.0.1'
+    stream_ip: str = '0.0.0.0'
     stream_port: int = 8080
+    
+    # Unity prompt receiver
+    enable_prompt_receiver: int = 1
+    prompt_port: int = 8081
 
     debug: int = 0
     """Enable debug mode with timing info (0=off, 1=on)"""
@@ -232,24 +238,43 @@ def rollout(denoiser_args, denoiser_model, vae_args, vae_model, diffusion, datas
 
 
 def read_input():
+    """Read prompts from terminal (runs in a separate thread)"""
     global text_prompt
     global text_embedding
     global motion_tensor
     global vertex_cache, joints_cache
     while True:
         user_input = input()
-        print(f"You entered new prompt: {user_input}")
-        text_prompt = user_input
-        text_embedding = encode_text(dataset.clip_model, [text_prompt], force_empty_zero=True).to(dtype=torch.float32,
-                                                                                              device=device)  # [1, 512]
-        motion_tensor = motion_tensor[:, :frame_idx + 1, :]
-        # Truncate vertex cache to match
-        if vertex_cache is not None and vertex_cache.shape[0] > frame_idx + 1:
-            vertex_cache = vertex_cache[:frame_idx + 1]
-            joints_cache = joints_cache[:frame_idx + 1]
+        if user_input:
+            apply_new_prompt(user_input)
         if user_input.lower() == "exit":
             print("Exit")
             break
+
+
+def apply_new_prompt(new_prompt: str):
+    """Apply a new text prompt (from terminal or Unity)"""
+    global text_prompt, text_embedding, motion_tensor
+    global vertex_cache, joints_cache
+    
+    print(f"[PromptHandler] New prompt: '{new_prompt}'")
+    text_prompt = new_prompt
+    text_embedding = encode_text(dataset.clip_model, [text_prompt], force_empty_zero=True).to(
+        dtype=torch.float32, device=device
+    )
+    
+    # Truncate motion to current frame
+    motion_tensor = motion_tensor[:, :frame_idx + 1, :]
+    
+    # Truncate caches to match
+    if vertex_cache is not None and vertex_cache.shape[0] > frame_idx + 1:
+        vertex_cache = vertex_cache[:frame_idx + 1]
+        joints_cache = joints_cache[:frame_idx + 1]
+
+
+def on_unity_prompt(prompt: str):
+    """Callback for prompts received from Unity via UnityPromptReceiver"""
+    apply_new_prompt(prompt)
 
 # Global cache for pre-computed vertices and joints
 vertex_cache = None  # Will hold pre-computed vertices for all frames
@@ -544,6 +569,14 @@ if __name__ == '__main__':
     if rollout_args.enable_streaming:
         streamer = UnityStreamer(host=rollout_args.stream_ip, port=rollout_args.stream_port)
         print(f"Streaming enabled on {rollout_args.stream_ip}:{rollout_args.stream_port}")
+
+    if rollout_args.enable_prompt_receiver:
+        prompt_receiver = UnityPromptReceiver(
+            host=rollout_args.stream_ip, 
+            port=rollout_args.prompt_port,
+            on_prompt_received=on_unity_prompt
+        )
+        print(f"Unity prompt receiver enabled on {rollout_args.stream_ip}:{rollout_args.prompt_port}")
 
     start()
 

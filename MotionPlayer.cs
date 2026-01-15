@@ -6,14 +6,21 @@ using System;
 
 /// <summary>
 /// Plays back recorded animation data from a JSON file.
-/// Works with the same data format as MotionReceiver.
+/// Uses HumanPoseHandler for proper muscle-space retargeting between different avatar skeletons.
 /// </summary>
 public class MotionPlayer : MonoBehaviour
 {
-    [Header("Target Settings")]
-    [Tooltip("Assign the Animator component of the character you want to animate.")]
-    public Animator targetAnimator;
-    public float positionScale = 1.0f;
+    [Header("SMPL Avatar (Reference)")]
+    [Tooltip("The SMPL for Unity avatar - receives direct SMPL rotations")]
+    public Animator smplAnimator;
+    public float smplPositionScale = 1.0f;
+    
+    [Header("Standard Avatar (Retargeted)")]
+    [Tooltip("Standard Unity humanoid avatar - pose is copied from SMPL via HumanPose")]
+    public Animator standardAnimator;
+    public float standardPositionScale = 1.0f;
+    [Tooltip("Position offset for side-by-side comparison")]
+    public Vector3 standardPositionOffset = new Vector3(1.5f, 0, 0);
     
     [Header("Playback Settings")]
     [Tooltip("Path to the recording file (absolute or relative to persistentDataPath)")]
@@ -24,6 +31,12 @@ public class MotionPlayer : MonoBehaviour
     
     [Tooltip("Loop the animation")]
     public bool loop = true;
+    
+    [Header("Root Rotation Correction")]
+    [Tooltip("Rotation around X axis for root. -90 works for DART")]
+    public float rootCorrectionX = -90f;
+    public float rootCorrectionY = 0f;
+    public float rootCorrectionZ = 0f;
     
     [Header("Controls")]
     public bool isPlaying = false;
@@ -40,6 +53,14 @@ public class MotionPlayer : MonoBehaviour
     private float playbackStartTime = 0f;
     private Dictionary<string, HumanBodyBones> boneMap;
     
+    // T-pose storage for SMPL avatar
+    private Dictionary<HumanBodyBones, Quaternion> smplTPose;
+    
+    // HumanPose handlers for muscle-space retargeting
+    private HumanPoseHandler smplPoseHandler;
+    private HumanPoseHandler standardPoseHandler;
+    private HumanPose humanPose;
+    
     [System.Serializable]
     public class RecordedFrame
     {
@@ -50,14 +71,9 @@ public class MotionPlayer : MonoBehaviour
     [System.Serializable]
     public class RecordingData
     {
-        public string createdAt;
-        public float totalDuration;
-        public int totalFrames;
-        public float averageFps;
         public List<RecordedFrame> frames;
     }
     
-    // Frame data classes (same as MotionReceiver)
     [System.Serializable]
     public class JointData
     {
@@ -75,63 +91,92 @@ public class MotionPlayer : MonoBehaviour
     void Start()
     {
         InitializeBoneMap();
-        
-        if (targetAnimator == null)
+        CaptureSmplTPose();
+        InitializeHumanPoseHandlers();
+        LoadRecording();
+        Play();
+    }
+    
+    void InitializeHumanPoseHandlers()
+    {
+        if (smplAnimator != null && smplAnimator.avatar != null && smplAnimator.avatar.isHuman)
         {
-            targetAnimator = GetComponent<Animator>();
+            smplPoseHandler = new HumanPoseHandler(smplAnimator.avatar, smplAnimator.transform);
+            Debug.Log("[MotionPlayer] Created HumanPoseHandler for SMPL avatar");
         }
         
-        if (targetAnimator == null)
+        if (standardAnimator != null && standardAnimator.avatar != null && standardAnimator.avatar.isHuman)
         {
-            Debug.LogError("MotionPlayer: No Target Animator assigned!");
+            standardPoseHandler = new HumanPoseHandler(standardAnimator.avatar, standardAnimator.transform);
+            Debug.Log("[MotionPlayer] Created HumanPoseHandler for Standard avatar");
         }
+        
+        humanPose = new HumanPose();
     }
     
     void InitializeBoneMap()
     {
-        boneMap = new Dictionary<string, HumanBodyBones>();
-        boneMap["Hips"] = HumanBodyBones.Hips;
-        boneMap["Spine"] = HumanBodyBones.Spine;
-        boneMap["Chest"] = HumanBodyBones.Chest;
-        boneMap["UpperChest"] = HumanBodyBones.UpperChest;
-        boneMap["Neck"] = HumanBodyBones.Neck;
-        boneMap["Head"] = HumanBodyBones.Head;
+        boneMap = new Dictionary<string, HumanBodyBones>
+        {
+            ["Hips"] = HumanBodyBones.Hips,
+            ["Spine"] = HumanBodyBones.Spine,
+            ["Chest"] = HumanBodyBones.Chest,
+            ["UpperChest"] = HumanBodyBones.UpperChest,
+            ["Neck"] = HumanBodyBones.Neck,
+            ["Head"] = HumanBodyBones.Head,
+            
+            ["LeftUpperLeg"] = HumanBodyBones.LeftUpperLeg,
+            ["LeftLowerLeg"] = HumanBodyBones.LeftLowerLeg,
+            ["LeftFoot"] = HumanBodyBones.LeftFoot,
+            ["LeftToes"] = HumanBodyBones.LeftToes,
+            
+            ["RightUpperLeg"] = HumanBodyBones.RightUpperLeg,
+            ["RightLowerLeg"] = HumanBodyBones.RightLowerLeg,
+            ["RightFoot"] = HumanBodyBones.RightFoot,
+            ["RightToes"] = HumanBodyBones.RightToes,
+            
+            ["LeftShoulder"] = HumanBodyBones.LeftShoulder,
+            ["LeftUpperArm"] = HumanBodyBones.LeftUpperArm,
+            ["LeftLowerArm"] = HumanBodyBones.LeftLowerArm,
+            ["LeftHand"] = HumanBodyBones.LeftHand,
+            
+            ["RightShoulder"] = HumanBodyBones.RightShoulder,
+            ["RightUpperArm"] = HumanBodyBones.RightUpperArm,
+            ["RightLowerArm"] = HumanBodyBones.RightLowerArm,
+            ["RightHand"] = HumanBodyBones.RightHand
+        };
+    }
+    
+    void CaptureSmplTPose()
+    {
+        smplTPose = new Dictionary<HumanBodyBones, Quaternion>();
         
-        boneMap["LeftUpperLeg"] = HumanBodyBones.LeftUpperLeg;
-        boneMap["LeftLowerLeg"] = HumanBodyBones.LeftLowerLeg;
-        boneMap["LeftFoot"] = HumanBodyBones.LeftFoot;
-        boneMap["LeftToes"] = HumanBodyBones.LeftToes;
+        if (smplAnimator == null) return;
         
-        boneMap["RightUpperLeg"] = HumanBodyBones.RightUpperLeg;
-        boneMap["RightLowerLeg"] = HumanBodyBones.RightLowerLeg;
-        boneMap["RightFoot"] = HumanBodyBones.RightFoot;
-        boneMap["RightToes"] = HumanBodyBones.RightToes;
+        foreach (var kvp in boneMap)
+        {
+            Transform bone = smplAnimator.GetBoneTransform(kvp.Value);
+            if (bone != null)
+            {
+                smplTPose[kvp.Value] = bone.localRotation;
+            }
+        }
         
-        boneMap["LeftShoulder"] = HumanBodyBones.LeftShoulder;
-        boneMap["LeftUpperArm"] = HumanBodyBones.LeftUpperArm;
-        boneMap["LeftLowerArm"] = HumanBodyBones.LeftLowerArm;
-        boneMap["LeftHand"] = HumanBodyBones.LeftHand;
-        
-        boneMap["RightShoulder"] = HumanBodyBones.RightShoulder;
-        boneMap["RightUpperArm"] = HumanBodyBones.RightUpperArm;
-        boneMap["RightLowerArm"] = HumanBodyBones.RightLowerArm;
-        boneMap["RightHand"] = HumanBodyBones.RightHand;
+        Debug.Log($"[MotionPlayer] Captured SMPL T-pose: {smplTPose.Count} bones");
     }
     
     void Update()
     {
-        if (!isPlaying || frames.Count == 0 || targetAnimator == null) return;
+        if (!isPlaying || frames.Count == 0 || smplAnimator == null) return;
         
         currentTime = (Time.time - playbackStartTime) * playbackSpeed;
         
-        // Find the appropriate frame for current time
         int frameIndex = FindFrameForTime(currentTime);
         
         if (frameIndex >= frames.Count)
         {
             if (loop)
             {
-                // Reset playback
                 playbackStartTime = Time.time;
                 currentTime = 0f;
                 currentFrameIndex = 0;
@@ -151,7 +196,7 @@ public class MotionPlayer : MonoBehaviour
         }
     }
     
-    private int FindFrameForTime(float time)
+    int FindFrameForTime(float time)
     {
         for (int i = 0; i < frames.Count; i++)
         {
@@ -171,17 +216,18 @@ public class MotionPlayer : MonoBehaviour
         LoadRecording(recordingFilePath);
     }
     
-    /// <summary>
-    /// Load a recording from file
-    /// </summary>
-    public void LoadRecording(string filePath)
+    public void LoadRecording(string path)
     {
-        string fullPath = filePath;
-        
-        // Check if relative path
-        if (!File.Exists(fullPath))
+        if (string.IsNullOrEmpty(path))
         {
-            fullPath = Path.Combine(Application.persistentDataPath, filePath);
+            Debug.LogWarning("[MotionPlayer] No recording file path specified.");
+            return;
+        }
+        
+        string fullPath = path;
+        if (!Path.IsPathRooted(path))
+        {
+            fullPath = Path.Combine(Application.persistentDataPath, path);
         }
         
         if (!File.Exists(fullPath))
@@ -195,16 +241,21 @@ public class MotionPlayer : MonoBehaviour
             string json = File.ReadAllText(fullPath);
             RecordingData data = JsonUtility.FromJson<RecordingData>(json);
             
-            frames = data.frames;
-            totalFrames = data.totalFrames;
-            currentFrameIndex = 0;
-            currentTime = 0f;
-            
-            Debug.Log($"[MotionPlayer] Loaded recording: {totalFrames} frames, {data.totalDuration:F2}s duration");
+            if (data != null && data.frames != null)
+            {
+                frames = data.frames;
+                totalFrames = frames.Count;
+                currentFrameIndex = 0;
+                Debug.Log($"[MotionPlayer] Loaded {frames.Count} frames from {fullPath}");
+            }
+            else
+            {
+                Debug.LogError("[MotionPlayer] Failed to parse recording file.");
+            }
         }
         catch (Exception e)
         {
-            Debug.LogError($"[MotionPlayer] Failed to load recording: {e.Message}");
+            Debug.LogError($"[MotionPlayer] Error loading recording: {e.Message}");
         }
     }
     
@@ -215,7 +266,7 @@ public class MotionPlayer : MonoBehaviour
     {
         if (frames.Count == 0)
         {
-            Debug.LogWarning("[MotionPlayer] No recording loaded. Call LoadRecording first.");
+            Debug.LogWarning("[MotionPlayer] No frames loaded.");
             return;
         }
         
@@ -235,7 +286,6 @@ public class MotionPlayer : MonoBehaviour
         isPlaying = false;
         currentFrameIndex = 0;
         currentTime = 0f;
-        
         Debug.Log("[MotionPlayer] Playback stopped.");
     }
     
@@ -255,37 +305,74 @@ public class MotionPlayer : MonoBehaviour
     {
         if (frames.Count == 0) return;
         
-        // Adjust start time to maintain position
         playbackStartTime = Time.time - (currentTime / playbackSpeed);
         isPlaying = true;
         
         Debug.Log("[MotionPlayer] Playback resumed.");
     }
     
-    private void ApplyFrame(string json)
+    void ApplyFrame(string json)
     {
         FrameData data = JsonUtility.FromJson<FrameData>(json);
         if (data == null) return;
         
-        // Apply Root Position
+        // Process root position
+        Vector3 smplPos = Vector3.zero;
         if (data.root_pos != null && data.root_pos.Length == 3)
         {
-            Vector3 pos = new Vector3(data.root_pos[0], data.root_pos[1], data.root_pos[2]);
-            if (debugMode) Debug.Log($"[MotionPlayer] Root Pos: {pos * positionScale}");
-            targetAnimator.transform.position = pos * positionScale;
+            smplPos = new Vector3(data.root_pos[0], data.root_pos[1], data.root_pos[2]);
+            // Convert from SMPL coordinate system (Z-up) to Unity (Y-up)
+            smplPos = new Vector3(smplPos.x, smplPos.z, -smplPos.y);
         }
         
-        // Apply Joint Rotations
+        // Apply position to SMPL avatar
+        if (smplAnimator != null)
+        {
+            smplAnimator.transform.position = smplPos * smplPositionScale;
+        }
+
+        // Apply Joint Rotations to SMPL avatar
+        Quaternion rootCorrection = Quaternion.Euler(rootCorrectionX, rootCorrectionY, rootCorrectionZ);
+        
         foreach (var joint in data.joints)
         {
-            if (boneMap.ContainsKey(joint.name))
+            if (!boneMap.ContainsKey(joint.name)) continue;
+            
+            HumanBodyBones boneType = boneMap[joint.name];
+            
+            if (smplAnimator == null) continue;
+            
+            Transform bone = smplAnimator.GetBoneTransform(boneType);
+            if (bone == null) continue;
+            
+            // Get and convert rotation - Index 6: (-x, y, -z, w) works for DART
+            Quaternion smplRot = new Quaternion(joint.rot[0], joint.rot[1], joint.rot[2], joint.rot[3]);
+            smplRot = new Quaternion(-smplRot.x, smplRot.y, -smplRot.z, smplRot.w);
+            
+            // Apply with T-pose offset
+            Quaternion finalRot = smplTPose.ContainsKey(boneType) 
+                ? smplTPose[boneType] * smplRot 
+                : smplRot;
+            
+            // Root correction for Hips
+            if (boneType == HumanBodyBones.Hips)
             {
-                Transform bone = targetAnimator.GetBoneTransform(boneMap[joint.name]);
-                if (bone != null)
-                {
-                    Quaternion rot = new Quaternion(joint.rot[0], joint.rot[1], joint.rot[2], joint.rot[3]);
-                    bone.localRotation = rot;
-                }
+                finalRot = rootCorrection * finalRot;
+            }
+            
+            bone.localRotation = finalRot;
+        }
+        
+        // Copy pose from SMPL to Standard avatar via HumanPose (muscle space)
+        if (smplPoseHandler != null && standardPoseHandler != null)
+        {
+            smplPoseHandler.GetHumanPose(ref humanPose);
+            standardPoseHandler.SetHumanPose(ref humanPose);
+            
+            // Apply position offset for comparison view
+            if (standardAnimator != null)
+            {
+                standardAnimator.transform.position = smplPos * standardPositionScale + standardPositionOffset;
             }
         }
     }

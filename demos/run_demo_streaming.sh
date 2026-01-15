@@ -8,6 +8,8 @@ use_predicted_joints=1
 enable_streaming=1
 stream_ip='0.0.0.0'
 stream_port=8080
+enable_prompt_receiver=1
+prompt_port=8081
 
 unset CUDA_VISIBLE_DEVICES
 
@@ -27,5 +29,7 @@ for model in "${model_list[@]}"; do
     --enable_streaming $enable_streaming \
     --stream_ip $stream_ip \
     --stream_port $stream_port \
+    --enable_prompt_receiver $enable_prompt_receiver \
+    --prompt_port $prompt_port \
     --debug $debug
 done
