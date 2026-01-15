@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
+using TMPro;
 using System.Net.Sockets;
 using System.Text;
 using System;
@@ -24,7 +25,7 @@ public class MotionPromptSender : MonoBehaviour
     
     [Header("UI References (Optional)")]
     [Tooltip("Input field for typing prompts")]
-    public InputField promptInputField;
+    public TMP_InputField promptInputField;
     
     [Tooltip("Button to send prompt")]
     public Button sendButton;
