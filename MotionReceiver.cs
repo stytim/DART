@@ -42,15 +42,11 @@ public class MotionReceiver : MonoBehaviour
     [Tooltip("Position offset for side-by-side comparison")]
     public Vector3 standardPositionOffset = new Vector3(1.5f, 0, 0);
     
-    [Header("Coordinate Conversion")]
-    [Tooltip("Rotation conversion index. 6 = (-x, y, -z, w) works for DART")]
-    public int rotationConversionIndex = 6;
-    
     [Header("Root Rotation Correction")]
     [Tooltip("Rotation around X axis for root. -90 works for DART")]
-    public float rootCorrectionX = -90f;
-    public float rootCorrectionY = 0f;
-    public float rootCorrectionZ = 0f;
+    private float rootCorrectionX = -90f;
+    private float rootCorrectionY = 0f;
+    private float rootCorrectionZ = 0f;
     
     [Header("Recording (Optional)")]
     public MotionRecorder recorder;
@@ -173,7 +169,7 @@ public class MotionReceiver : MonoBehaviour
 
     void Update()
     {
-        if (client == null || !client.Connected) return;
+        if (client == null || !client.Connected || stream == null) return;
 
         if (stream.DataAvailable)
         {
