@@ -5,6 +5,8 @@ using System.Net.Sockets;
 using System.Text;
 using System.IO;
 using System;
+using System.Threading;
+using System.Collections.Concurrent;
 
 [System.Serializable]
 public class JointData
@@ -22,6 +24,7 @@ public class FrameData
 
 /// <summary>
 /// Receives animation data from DART streamer and applies to Unity Humanoid avatars.
+/// Uses background thread for network I/O to prevent main thread blocking.
 /// Uses HumanPoseHandler for proper muscle-space retargeting between different avatar skeletons.
 /// </summary>
 public class MotionReceiver : MonoBehaviour
@@ -43,7 +46,6 @@ public class MotionReceiver : MonoBehaviour
     public Vector3 standardPositionOffset = new Vector3(1.5f, 0, 0);
     
     [Header("Root Rotation Correction")]
-    [Tooltip("Rotation around X axis for root. -90 works for DART")]
     private float rootCorrectionX = -90f;
     private float rootCorrectionY = 0f;
     private float rootCorrectionZ = 0f;
@@ -57,6 +59,18 @@ public class MotionReceiver : MonoBehaviour
     private TcpClient client;
     private NetworkStream stream;
     private StreamReader reader;
+    
+    // Background thread for network reading
+    private Thread networkThread;
+    private volatile bool isRunning = false;
+    
+    // Thread-safe frame storage - latest frame always available
+    private volatile string latestFrameJson = null;
+    private readonly object frameLock = new object();
+    
+    // Stats
+    private int framesReceived = 0;
+    private int framesProcessed = 0;
 
     // Bone Mapping for SMPL joints to Unity Humanoid
     private Dictionary<string, HumanBodyBones> boneMap;
@@ -161,38 +175,81 @@ public class MotionReceiver : MonoBehaviour
             client.EndConnect(ar);
             stream = client.GetStream();
             reader = new StreamReader(stream, Encoding.UTF8);
-            Debug.Log("Connected to DART Streamer!");
+            Debug.Log("[MotionReceiver] Connected to DART Streamer!");
+            
+            // Start background network reading thread
+            isRunning = true;
+            networkThread = new Thread(NetworkReadLoop);
+            networkThread.IsBackground = true;
+            networkThread.Start();
+            Debug.Log("[MotionReceiver] Started background network thread");
+            
         } catch (Exception e) {
             Debug.LogError($"Connect Error: {e.Message}");
         }
     }
+    
+    /// <summary>
+    /// Background thread that continuously reads from network.
+    /// Stores the latest frame for Update() to consume.
+    /// </summary>
+    void NetworkReadLoop()
+    {
+        while (isRunning && client != null && client.Connected)
+        {
+            try
+            {
+                // ReadLine blocks until data is available - this is fine on background thread
+                string line = reader.ReadLine();
+                
+                if (!string.IsNullOrEmpty(line))
+                {
+                    lock (frameLock)
+                    {
+                        latestFrameJson = line;
+                        framesReceived++;
+                    }
+                }
+            }
+            catch (IOException)
+            {
+                // Connection closed
+                break;
+            }
+            catch (Exception e)
+            {
+                if (isRunning)
+                {
+                    Debug.LogWarning($"[MotionReceiver] Network read error: {e.Message}");
+                }
+                break;
+            }
+        }
+        
+        Debug.Log("[MotionReceiver] Network thread exited");
+    }
 
     void Update()
     {
-        if (client == null || !client.Connected || stream == null) return;
-
-        if (stream.DataAvailable)
+        // Get latest frame from background thread (non-blocking)
+        string frameJson = null;
+        lock (frameLock)
         {
-            try {
-                string lastLine = null;
-                while (stream.DataAvailable) {
-                    string line = reader.ReadLine();
-                    if (!string.IsNullOrEmpty(line)) lastLine = line;
-                }
-
-                if (lastLine != null) {
-                    if (debugMode) Debug.Log($"[DART] Received JSON: {lastLine}");
-                    
-                    if (recorder != null)
-                    {
-                        recorder.RecordFrame(lastLine);
-                    }
-                    
-                    ProcessFrame(lastLine);
-                }
-            } catch (Exception e) {
-                Debug.LogWarning($"Read Error: {e.Message}");
+            frameJson = latestFrameJson;
+            latestFrameJson = null; // Consume it
+        }
+        
+        if (frameJson != null)
+        {
+            if (debugMode) Debug.Log($"[DART] Processing frame (received: {framesReceived}, processed: {framesProcessed})");
+            
+            if (recorder != null)
+            {
+                recorder.RecordFrame(frameJson);
             }
+            
+            ProcessFrame(frameJson);
+            framesProcessed++;
         }
     }
 
@@ -270,6 +327,14 @@ public class MotionReceiver : MonoBehaviour
 
     void OnDestroy()
     {
+        isRunning = false;
+        
+        if (networkThread != null && networkThread.IsAlive)
+        {
+            // Give thread time to exit gracefully
+            networkThread.Join(100);
+        }
+        
         if (client != null) client.Close();
     }
 }

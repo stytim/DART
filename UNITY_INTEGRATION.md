@@ -73,6 +73,109 @@ Two additional scripts are provided for recording and playing back animation dat
 4.  Set the **Recording File Path** to your saved recording.
 5.  Call `LoadRecording()` then `Play()` to play back the animation.
 
+---
+
+## Motion In-Betweening (NEW)
+
+Generate smooth transitions between two animation keyframes using text prompts. This is useful for seamlessly connecting pre-recorded animation sequences.
+
+### Architecture
+
+```mermaid
+sequenceDiagram
+    participant Unity
+    participant Requester as MotionInbetweenRequester
+    participant Server as DART Inbetween Server
+    participant Receiver as MotionReceiverInbetween
+    
+    Unity->>Requester: RequestInbetween(startPose, endPose, "walk")
+    Requester->>Server: JSON with keyframes + prompt
+    Note over Server: Generate transition (~0.5-1s)
+    loop For each frame
+        Server->>Receiver: Stream animation frame
+        Receiver->>Receiver: Incremental blend
+    end
+    Receiver->>Unity: OnInbetweenComplete event
+```
+
+### Python Server Setup
+
+Start the in-betweening server:
+```bash
+# Fast mode (~0.5-1s generation time)
+source demos/run_demo_inbetween_streaming.sh
+```
+
+The server listens on:
+- **Port 8080**: Motion streaming to Unity
+- **Port 8082**: Keyframe requests from Unity
+
+### Unity Setup
+
+1. Copy these scripts to your Unity project:
+   - `MotionInbetweenRequester.cs` - Sends keyframe requests
+   - `MotionReceiverInbetween.cs` - Receives and blends frames
+
+2. Create GameObjects and attach scripts:
+   ```
+   InbetweenManager (GameObject)
+   ├── MotionInbetweenRequester component
+   └── MotionReceiverInbetween component
+   ```
+
+3. Configure the components in Inspector:
+   - Set `Host` and `Port` to match your DART server
+   - Assign your SMPL Animator to both components
+   - Set `Blend Mode` to `Incremental` for smooth transitions
+
+### Using with FBX Mocap Animations
+
+Use the provided `AnimationTransitionController.cs` script to transition between FBX animation files:
+
+1. Copy `AnimationTransitionController.cs` to your Unity project
+2. Add it to the same GameObject as your other DART components
+3. Drag your FBX animation clips into the **Animations** list
+4. Set a **Default Prompt** like "walk forward" or "turn around"
+5. Call transitions from your code:
+
+```csharp
+// Get reference to controller
+AnimationTransitionController controller = GetComponent<AnimationTransitionController>();
+
+// Transition by index
+controller.TransitionToAnimation(0, "walk forward");
+
+// Transition by clip name
+controller.TransitionToAnimation("IdleToWalk", "start walking");
+
+// Transition directly with clip
+controller.TransitionToAnimation(myAnimationClip, "jump");
+```
+
+### Blend Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `Immediate` | Apply frames as they arrive | Low latency, may be jerky |
+| `Incremental` | Smooth blend between frames | **Recommended** for smooth transitions |
+| `BufferAndPlay` | Buffer all, then play | Highest quality, but delayed start |
+
+### Events
+
+```csharp
+// MotionInbetweenRequester events
+OnGenerationStarted    // Request sent, generation starting
+OnFrameReceived(int frameIndex, int totalFrames)  // Progress updates
+OnGenerationComplete(bool success)  // Generation finished
+
+// MotionReceiverInbetween events
+OnInbetweenStarted     // First frame received
+OnInbetweenProgress(float progress)  // 0-1 progress
+OnInbetweenComplete    // All frames played
+```
+
+---
+
 ## Troubleshooting
 *   **Twisted Limbs**: Check the Coordinate System conversion in `utils/unity_streamer.py`. If limbs are twisted, try swapping the quaternion components (e.g., negate x or w).
 *   **Latency**: The Unity script currently drains the buffer to play the latest frame. If it's too jittery, implement a jitter buffer (interpolate between frames).

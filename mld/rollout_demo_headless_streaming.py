@@ -285,12 +285,29 @@ if __name__ == '__main__':
             future_tensor = primitive_utility.dict_to_tensor(future_feature_dict)
             motion_tensor = torch.cat([motion_tensor, future_tensor], dim=1)
             
+            # Limit motion tensor size to prevent memory growth (sliding window)
+            MAX_HISTORY_FRAMES = 1000  # Keep ~33 seconds at 30fps
+            if motion_tensor.shape[1] > MAX_HISTORY_FRAMES:
+                trim_amount = motion_tensor.shape[1] - MAX_HISTORY_FRAMES
+                motion_tensor = motion_tensor[:, trim_amount:, :].contiguous()
+                frame_idx -= trim_amount
+            
+            # Clean up intermediate tensors to free GPU memory
+            del x_start_pred, latent_pred, future_motion_pred, future_frames
+            del future_feature_dict, future_tensor
+            del history_motion_tensor, history_feature_dict
+            del canonicalized_history_primitive_dict, blended_feature_dict
+            del history_motion_normalized
+            torch.cuda.empty_cache()
+            
             t_end = time.time()
             
             if args.debug:
+                gpu_mem_gb = torch.cuda.memory_allocated() / (1024**3)
+                gpu_reserved_gb = torch.cuda.memory_reserved() / (1024**3)
                 print(f"[TIMING] prep: {(t_prep-t_start)*1000:.1f}ms, diffusion: {(t_diffusion-t_prep)*1000:.1f}ms, "
                       f"decode: {(t_decode-t_diffusion)*1000:.1f}ms, post: {(t_end-t_decode)*1000:.1f}ms, "
-                      f"TOTAL: {(t_end-t_start)*1000:.1f}ms")
+                      f"TOTAL: {(t_end-t_start)*1000:.1f}ms | GPU: {gpu_mem_gb:.2f}GB alloc, {gpu_reserved_gb:.2f}GB reserved")
         
         # Stream current frame
         if streamer and frame_idx < motion_tensor.shape[1]:
