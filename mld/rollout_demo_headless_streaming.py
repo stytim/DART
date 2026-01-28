@@ -1,6 +1,7 @@
 """Headless streaming demo - real-time animation generation with Unity streaming, no visualization"""
 from __future__ import annotations
 
+import gc
 import os
 import random
 import time
@@ -56,9 +57,12 @@ class ClassifierFreeWrapper(torch.nn.Module):
         self.cond_mask_prob = model.cond_mask_prob
 
     def forward(self, x, timesteps, y=None):
-        y['uncond'] = False
-        out = self.model(x, timesteps, y)
-        y_uncond = y
+        # Create copies to avoid mutating the original dict (prevents reference accumulation)
+        y_cond = {k: v for k, v in y.items()}
+        y_cond['uncond'] = False
+        out = self.model(x, timesteps, y_cond)
+        
+        y_uncond = {k: v for k, v in y.items()}
         y_uncond['uncond'] = True
         out_uncond = self.model(x, timesteps, y_uncond)
         return out_uncond + (y['scale'] * (out - out_uncond))
@@ -126,9 +130,10 @@ def apply_new_prompt(new_prompt: str):
     
     print(f"[PromptHandler] New prompt: '{new_prompt}'")
     text_prompt = new_prompt
-    text_embedding = encode_text(dataset.clip_model, [text_prompt], force_empty_zero=True).to(
-        dtype=torch.float32, device=device
-    )
+    with torch.no_grad():
+        text_embedding = encode_text(dataset.clip_model, [text_prompt], force_empty_zero=True).to(
+            dtype=torch.float32, device=device
+        )
     
     # Truncate motion to current frame to apply new prompt immediately
     motion_tensor = motion_tensor[:, :frame_idx + 1, :]
@@ -183,9 +188,15 @@ if __name__ == '__main__':
         'gender': gender,
     })
     
-    text_embedding = encode_text(dataset.clip_model, [text_prompt], force_empty_zero=True).to(dtype=torch.float32, device=device)
+    with torch.no_grad():
+        text_embedding = encode_text(dataset.clip_model, [text_prompt], force_empty_zero=True).to(dtype=torch.float32, device=device)
     
     sample_fn = diffusion.ddim_sample_loop
+    
+    # Pre-allocate reusable tensors (created once, reused each cycle to avoid memory growth)
+    identity_rotmat = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
+    zero_transl = torch.zeros(3, device=device, dtype=torch.float32).reshape(1, 1, 3).repeat(batch_size, 1, 1)
+    guidance_param = torch.ones(batch_size, *denoiser_args.model_args.noise_shape, device=device) * args.guidance_param
     
     # Initialize streaming
     streamer = None
@@ -226,78 +237,81 @@ if __name__ == '__main__':
         if frame_idx >= motion_tensor.shape[1] - 1:
             t_start = time.time()
             
-            # Prepare rollout
-            guidance_param = torch.ones(batch_size, *denoiser_args.model_args.noise_shape, device=device) * args.guidance_param
-            history_motion_tensor = motion_tensor[:, -history_length:, :]
-            history_feature_dict = primitive_utility.tensor_to_dict(history_motion_tensor)
-            transf_rotmat = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1, 1)
-            transf_transl = torch.zeros(3, device=device, dtype=torch.float32).reshape(1, 1, 3).repeat(batch_size, 1, 1)
-            history_feature_dict.update({
-                'transf_rotmat': transf_rotmat,
-                'transf_transl': transf_transl,
-                'gender': gender,
-                'betas': betas[:, :history_length, :],
-                'pelvis_delta': pelvis_delta,
-            })
-            canonicalized_history_primitive_dict, blended_feature_dict = primitive_utility.get_blended_feature(
-                history_feature_dict, use_predicted_joints=args.use_predicted_joints)
-            transf_rotmat, transf_transl = canonicalized_history_primitive_dict['transf_rotmat'], \
-                canonicalized_history_primitive_dict['transf_transl']
-            history_motion_normalized = dataset.normalize(primitive_utility.dict_to_tensor(blended_feature_dict))
-            t_prep = time.time()
+            # Wrap entire generation block in no_grad to prevent computation graph accumulation
+            with torch.no_grad():
+                # Prepare rollout (reuse pre-allocated tensors)
+                history_motion_tensor = motion_tensor[:, -history_length:, :]
+                history_feature_dict = primitive_utility.tensor_to_dict(history_motion_tensor)
+                history_feature_dict.update({
+                    'transf_rotmat': identity_rotmat,
+                    'transf_transl': zero_transl,
+                    'gender': gender,
+                    'betas': betas[:, :history_length, :],
+                    'pelvis_delta': pelvis_delta,
+                })
+                canonicalized_history_primitive_dict, blended_feature_dict = primitive_utility.get_blended_feature(
+                    history_feature_dict, use_predicted_joints=args.use_predicted_joints)
+                transf_rotmat, transf_transl = canonicalized_history_primitive_dict['transf_rotmat'], \
+                    canonicalized_history_primitive_dict['transf_transl']
+                history_motion_normalized = dataset.normalize(primitive_utility.dict_to_tensor(blended_feature_dict))
+                t_prep = time.time()
 
-            y = {
-                'text_embedding': text_embedding,
-                'history_motion_normalized': history_motion_normalized,
-                'scale': guidance_param,
-            }
+                y = {
+                    'text_embedding': text_embedding,
+                    'history_motion_normalized': history_motion_normalized,
+                    'scale': guidance_param,
+                }
 
-            # Diffusion
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                x_start_pred = sample_fn(
-                    denoiser_model,
-                    (batch_size, *denoiser_args.model_args.noise_shape),
-                    clip_denoised=False,
-                    model_kwargs={'y': y},
-                    progress=False,
-                )
-            torch.cuda.synchronize()
-            t_diffusion = time.time()
+                # Diffusion
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    x_start_pred = sample_fn(
+                        denoiser_model,
+                        (batch_size, *denoiser_args.model_args.noise_shape),
+                        clip_denoised=False,
+                        model_kwargs={'y': y},
+                        progress=False,
+                    )
+                torch.cuda.synchronize()
+                t_diffusion = time.time()
             
-            # Decode
-            latent_pred = x_start_pred.permute(1, 0, 2)
-            future_motion_pred = vae_model.decode(latent_pred, history_motion_normalized, nfuture=future_length,
-                                                  scale_latent=denoiser_args.rescale_latent)
-            torch.cuda.synchronize()
-            t_decode = time.time()
+                # Decode
+                latent_pred = x_start_pred.permute(1, 0, 2)
+                future_motion_pred = vae_model.decode(latent_pred, history_motion_normalized, nfuture=future_length,
+                                                      scale_latent=denoiser_args.rescale_latent)
+                torch.cuda.synchronize()
+                t_decode = time.time()
 
-            # Postprocess
-            future_frames = dataset.denormalize(future_motion_pred)
-            future_feature_dict = primitive_utility.tensor_to_dict(future_frames)
-            future_feature_dict.update({
-                'transf_rotmat': transf_rotmat,
-                'transf_transl': transf_transl,
-                'gender': gender,
-                'betas': betas[:, :future_length, :],
-                'pelvis_delta': pelvis_delta,
-            })
-            future_feature_dict = primitive_utility.transform_feature_to_world(future_feature_dict)
-            future_tensor = primitive_utility.dict_to_tensor(future_feature_dict)
-            motion_tensor = torch.cat([motion_tensor, future_tensor], dim=1)
+                # Postprocess
+                future_frames = dataset.denormalize(future_motion_pred)
+                future_feature_dict = primitive_utility.tensor_to_dict(future_frames)
+                future_feature_dict.update({
+                    'transf_rotmat': transf_rotmat,
+                    'transf_transl': transf_transl,
+                    'gender': gender,
+                    'betas': betas[:, :future_length, :],
+                    'pelvis_delta': pelvis_delta,
+                })
+                future_feature_dict = primitive_utility.transform_feature_to_world(future_feature_dict)
+                future_tensor = primitive_utility.dict_to_tensor(future_feature_dict)
+                # Detach to break computation graph before concatenation
+                motion_tensor = torch.cat([motion_tensor, future_tensor.detach()], dim=1)
             
-            # Limit motion tensor size to prevent memory growth (sliding window)
-            MAX_HISTORY_FRAMES = 1000  # Keep ~33 seconds at 30fps
-            if motion_tensor.shape[1] > MAX_HISTORY_FRAMES:
-                trim_amount = motion_tensor.shape[1] - MAX_HISTORY_FRAMES
-                motion_tensor = motion_tensor[:, trim_amount:, :].contiguous()
-                frame_idx -= trim_amount
+                # Limit motion tensor size to prevent memory growth (sliding window)
+                MAX_HISTORY_FRAMES = 1000  # Keep ~33 seconds at 30fps
+                if motion_tensor.shape[1] > MAX_HISTORY_FRAMES:
+                    trim_amount = motion_tensor.shape[1] - MAX_HISTORY_FRAMES
+                    motion_tensor = motion_tensor[:, trim_amount:, :].contiguous()
+                    frame_idx -= trim_amount
+            
+            # End of torch.no_grad() block
             
             # Clean up intermediate tensors to free GPU memory
             del x_start_pred, latent_pred, future_motion_pred, future_frames
             del future_feature_dict, future_tensor
             del history_motion_tensor, history_feature_dict
             del canonicalized_history_primitive_dict, blended_feature_dict
-            del history_motion_normalized
+            del history_motion_normalized, transf_rotmat, transf_transl, y
+            gc.collect()  # Force garbage collection
             torch.cuda.empty_cache()
             
             t_end = time.time()
